@@ -30,8 +30,10 @@ See output_schema_spec.md for the complete field-by-field specification.
 
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+from pyspark.sql.functions import broadcast
 
 from pipeline.config import load_config
+from pipeline.dq import detect_orphaned_transactions
 from pipeline.logger import get_logger
 from pipeline.mappings import (
     DIM_ACCOUNTS_COLUMNS,
@@ -51,12 +53,15 @@ def apply_renames(df, rename_map: dict[str, str]):
     return df
 
 
-def run_provisioning():
+def run_provisioning() -> tuple[dict[str, int], dict[str, int], dict]:
+    """Run Gold provisioning. Returns (gold_counts, dq_counts)."""
     config = load_config()
     spark = get_spark_session(config)
 
     silver_root = config["output"]["silver_path"]
     gold_root = config["output"]["gold_path"]
+
+    dq_counts: dict[str, int] = {}
 
     LOGGER.info("Starting Gold provisioning")
 
@@ -64,6 +69,14 @@ def run_provisioning():
     accounts_df = delta_read(spark, table_path(silver_root, "accounts"))
     transactions_df = delta_read(spark, table_path(silver_root, "transactions"))
 
+    # ── ORPHANED_ACCOUNT: explicitly detect and exclude ───────
+    # This replaces the silent inner-join drop with a counted, logged exclusion.
+    transactions_df, orphan_count = detect_orphaned_transactions(
+        transactions_df, accounts_df
+    )
+    dq_counts["ORPHANED_ACCOUNT"] = orphan_count
+
+    # ── dim_customers ─────────────────────────────────────────
     dim_customers = (
         customers_df.withColumn("customer_sk", stable_surrogate_key(F.col("customer_id")).cast(T.LongType()))
         .withColumn("age_band", age_band_from_dob("dob"))
@@ -71,33 +84,32 @@ def run_provisioning():
     )
     delta_write(dim_customers, table_path(gold_root, "dim_customers"))
 
+    # ── dim_accounts ──────────────────────────────────────────
     # Inner join ensures every dim_accounts row has a valid customer reference.
-    # This is the fix for Query 2 (zero unlinked accounts — zero tolerance).
     dim_accounts = (
         apply_renames(
             accounts_df.withColumn("account_sk", stable_surrogate_key(F.col("account_id")).cast(T.LongType())),
             DIM_ACCOUNTS_RENAMES,
         )
-        .join(dim_customers.select("customer_id"), on="customer_id", how="inner")
+        .join(broadcast(dim_customers.select("customer_id")), on="customer_id", how="inner")
         .select(*DIM_ACCOUNTS_COLUMNS)
     )
     delta_write(dim_accounts, table_path(gold_root, "dim_accounts"))
 
-    # Build a lookup: account_id → (account_sk, customer_sk) using dim_accounts
-    # which already has the validated customer_id linkage.
+    # ── fact_transactions ─────────────────────────────────────
     account_lookup = dim_accounts.select(
         F.col("account_id"),
         F.col("account_sk"),
         F.col("customer_id"),
     ).join(
-        dim_customers.select("customer_id", "customer_sk"),
+        broadcast(dim_customers.select("customer_id", "customer_sk")),
         on="customer_id",
         how="inner",
     )
 
     fact_transactions = (
         transactions_df.alias("t")
-        .join(account_lookup.alias("a"), on="account_id", how="inner")
+        .join(broadcast(account_lookup).alias("a"), on="account_id", how="inner")
         .withColumn("transaction_sk", stable_surrogate_key(F.col("transaction_id")).cast(T.LongType()))
         .select(
             "transaction_sk",
@@ -119,4 +131,28 @@ def run_provisioning():
     )
     delta_write(fact_transactions, table_path(gold_root, "fact_transactions"))
 
-    LOGGER.info("Gold provisioning completed")
+    # Compute gold counts and flag statistics from fact_transactions
+    total_ft = fact_transactions.count()
+    flag_counts_rows = (
+        fact_transactions.filter(F.col("dq_flag").isNotNull())
+        .groupBy("dq_flag")
+        .count()
+        .collect()
+    )
+    flag_counts = {row["dq_flag"]: row["count"] for row in flag_counts_rows}
+    flagged_total = sum(flag_counts.values())
+
+    gold_counts = {
+        "fact_transactions": total_ft,
+        "dim_accounts": dim_accounts.count(),
+        "dim_customers": dim_customers.count(),
+    }
+    flag_stats = {
+        "total_records": total_ft,
+        "clean_records": total_ft - flagged_total,
+        "flagged_records": flagged_total,
+        "flag_counts": flag_counts,
+    }
+
+    LOGGER.info("Gold provisioning completed — gold counts: %s, flag stats: %s", gold_counts, flag_stats)
+    return gold_counts, dq_counts, flag_stats

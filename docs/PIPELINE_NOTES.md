@@ -221,3 +221,80 @@ All verified via DuckDB `delta_scan` (exact method the scorer uses):
 5. **Multi-format date parsing** — `parse_date_column()` coalesces 3 formats. Designed for Stage 2 where date format variants are introduced.
 
 6. **Config-driven paths** — All I/O paths from `pipeline_config.yaml`. No hardcoded paths in pipeline code. Ready for Stage 2/3 path changes.
+
+---
+
+## Local Harness Setup (Windows + WSL2)
+
+The scoring harness (`infrastructure/run_tests.sh`) must run on Linux. On Windows, WSL2 is required because:
+- Git Bash mangles Docker volume paths (`/tmp/de_test_output.XXXXXX` → gets MSYS-translated incorrectly)
+- The harness creates a temp dir via `mktemp` and mounts it into Docker — this only works reliably in a true Linux shell
+
+### One-time WSL2 Setup
+
+**1. Enable WSL2 + Ubuntu**
+```
+wsl --install -d Ubuntu          # in PowerShell (Admin)
+wsl --set-version Ubuntu 2
+```
+
+**2. Enable Docker Desktop WSL2 integration**
+- Docker Desktop → Settings → Resources → WSL Integration → enable Ubuntu
+
+**3. Install DuckDB 1.5.2 in WSL Ubuntu**
+```bash
+# Run inside WSL (as root or with sudo):
+curl -L https://github.com/duckdb/duckdb/releases/download/v1.5.2/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
+unzip /tmp/duckdb.zip -d /tmp
+mv /tmp/duckdb /usr/local/bin/duckdb
+chmod +x /usr/local/bin/duckdb
+duckdb --version   # should print v1.5.2
+```
+
+> **Why 1.5.2 specifically?** The delta extension for DuckDB must be compatible with the Delta Lake 3.x format written by delta-spark 3.1.0. DuckDB 1.2.x has a delta extension that silently fails on these tables.
+
+**4. Fix DuckDB output format for the harness**
+
+DuckDB 1.5.2 defaults to box-drawing table output (e.g. `│ 1000000 │`) even when stdout is piped. The harness uses `grep -E '^[0-9]+$'` and `awk '{print $NF}'` to parse the output — both fail against box-drawing characters.
+
+Fix: create `/root/.duckdbrc` (or `~/.duckdbrc` for non-root users):
+```bash
+echo '.mode tabs'    > /root/.duckdbrc
+echo '.headers off' >> /root/.duckdbrc
+```
+
+This switches DuckDB to plain tab-separated output so the harness grep/awk works correctly.
+
+**5. Install delta extension for root**
+```bash
+duckdb -c "INSTALL delta; LOAD delta; SELECT 'ok';"
+```
+Run this once to pre-install the extension into root's home (`/root/.duckdb/extensions/`). The harness calls `INSTALL delta` every time but pre-installing avoids any network dependency.
+
+### Running the Harness
+
+From PowerShell (default WSL user is root, so no `-u root` needed):
+```powershell
+wsl -d Ubuntu -- bash -c "cd /mnt/c/Users/tinashe.chinyati/Downloads/d9e35951823b_stage1/stage1 && bash infrastructure/run_tests.sh --stage 1 --image nedbank-stage1-test --data-dir local_test"
+```
+
+Expected runtime: ~4-5 minutes (dominated by the Spark pipeline inside Docker).
+
+### Why Not Run It Directly in PowerShell / Git Bash?
+
+| Shell | Problem |
+|---|---|
+| PowerShell | Can't run bash scripts natively |
+| Git Bash | MSYS path translation mangles `mktemp` temp dirs when passed to Docker `-v` |
+| WSL (non-root user) | Docker writes output files as root; WSL user can't read them for DuckDB checks |
+| WSL as root | ✅ Works — Docker runs as root, files are readable, duckdbrc is in /root/ |
+
+### Symptoms to Watch For
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Check 4: `DuckDB could not read it as a Delta table` | `.duckdbrc` missing → box-drawing output fails grep | Create `/root/.duckdbrc` with `.mode tabs` + `.headers off` |
+| Check 5: `Q1 returned 0 rows` | Same output format issue | Same fix |
+| Check 4/5 errors about `delta extension not found` | DuckDB version too old (1.2.x) | Upgrade to 1.5.2 |
+| Check 2: container exits non-zero | Pipeline error inside Docker | Run container manually: `docker run ... nedbank-stage1-test` and read logs |
+| Check 2: files unreadable | Docker wrote as root, WSL user can't read | Run harness as root (`wsl -d Ubuntu -u root`) |
