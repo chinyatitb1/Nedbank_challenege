@@ -3,6 +3,7 @@ data/*.csv
 output/
 .docker_tmp/
 local_test/
+local_test_s2/
 sample/output/
 sample/bronze/
 sample/silver/
@@ -12,3 +13,5 @@ test_output*/
 **/_delta_log/
 __pycache__/
 *.py[cod]
+generate_stage2_data.py
+run_s2_test.sh

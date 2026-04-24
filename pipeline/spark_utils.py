@@ -1,4 +1,5 @@
 import os
+import shutil
 
 from pyspark.sql import SparkSession
 
@@ -20,6 +21,11 @@ def get_spark_session(config: dict) -> SparkSession:
     for subdir in ("bronze", "silver", "gold"):
         os.makedirs(f"/data/output/{subdir}", exist_ok=True)
 
+    # Spark shuffle/temp dir — use the output volume instead of /tmp (512 MB
+    # tmpfs that overflows at Stage 2 scale).  Cleaned up in stop_spark_session.
+    spark_tmp = "/data/output/.spark_tmp"
+    os.makedirs(spark_tmp, exist_ok=True)
+
     spark_config = config.get("spark", {})
     builder = (
         SparkSession.builder.master(spark_config.get("master", "local[2]"))
@@ -28,7 +34,7 @@ def get_spark_session(config: dict) -> SparkSession:
         .config("spark.driver.memory", "512m")
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.driver.bindAddress", "127.0.0.1")
-        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.sql.shuffle.partitions", "8")
         .config("spark.default.parallelism", "2")
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
@@ -38,8 +44,8 @@ def get_spark_session(config: dict) -> SparkSession:
         # extracted to /tmp, and DuckDB doesn't misinterpret the file
         # extension (e.g. .gz.parquet) as whole-file compression.
         .config("spark.sql.parquet.compression.codec", "uncompressed")
-        # Keep shuffle data in /tmp (writable tmpfs). No exec needed for data files.
-        .config("spark.local.dir", "/tmp")
+        # Shuffle/spill to the output volume — /tmp is only 512 MB tmpfs.
+        .config("spark.local.dir", spark_tmp)
     )
 
     _spark_session = builder.getOrCreate()
@@ -52,3 +58,7 @@ def stop_spark_session() -> None:
     if _spark_session is not None:
         _spark_session.stop()
         _spark_session = None
+    # Remove shuffle temp so it doesn't pollute the scored output tree.
+    spark_tmp = "/data/output/.spark_tmp"
+    if os.path.isdir(spark_tmp):
+        shutil.rmtree(spark_tmp, ignore_errors=True)
