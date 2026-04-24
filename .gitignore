@@ -1,3 +1,14 @@
 data/*.jsonl
 data/*.csv
 output/
+.docker_tmp/
+local_test/
+sample/output/
+sample/bronze/
+sample/silver/
+sample/gold/
+test_output*/
+**/part-*
+**/_delta_log/
+__pycache__/
+*.py[cod]
